@@ -1,97 +1,87 @@
-#!/usr/bin/env bash
+  
+# VERSION 1.10.9
+# AUTHOR: Matthieu "Puckel_" Roisil
+# DESCRIPTION: Basic Airflow container
+# BUILD: docker build --rm -t puckel/docker-airflow .
+# SOURCE: https://github.com/puckel/docker-airflow
 
-TRY_LOOP="20"
+FROM python:3.7-slim-buster
+LABEL maintainer="Puckel_"
 
-: "${REDIS_HOST:="redis"}"
-: "${REDIS_PORT:="6379"}"
-: "${REDIS_PASSWORD:=""}"
+# Never prompt the user for choices on installation/configuration of packages
+ENV DEBIAN_FRONTEND noninteractive
+ENV TERM linux
 
-: "${POSTGRES_HOST:="postgres"}"
-: "${POSTGRES_PORT:="5432"}"
-: "${POSTGRES_USER:="airflow"}"
-: "${POSTGRES_PASSWORD:="airflow"}"
-: "${POSTGRES_DB:="airflow"}"
+# Airflow
+ARG AIRFLOW_VERSION=1.10.9
+ARG AIRFLOW_USER_HOME=/usr/local/airflow
+ARG AIRFLOW_DEPS=""
+ARG PYTHON_DEPS=""
+ENV AIRFLOW_HOME=${AIRFLOW_USER_HOME}
 
-# Defaults and back-compat
-: "${AIRFLOW_HOME:="/usr/local/airflow"}"
-: "${AIRFLOW__CORE__FERNET_KEY:=${FERNET_KEY:=$(python -c "from cryptography.fernet import Fernet; FERNET_KEY = Fernet.generate_key().decode(); print(FERNET_KEY)")}}"
-: "${AIRFLOW__CORE__EXECUTOR:=${EXECUTOR:-Sequential}Executor}"
+# Define en_US.
+ENV LANGUAGE en_US.UTF-8
+ENV LANG en_US.UTF-8
+ENV LC_ALL en_US.UTF-8
+ENV LC_CTYPE en_US.UTF-8
+ENV LC_MESSAGES en_US.UTF-8
 
-export \
-  AIRFLOW_HOME \
-  AIRFLOW__CELERY__BROKER_URL \
-  AIRFLOW__CELERY__RESULT_BACKEND \
-  AIRFLOW__CORE__EXECUTOR \
-  AIRFLOW__CORE__FERNET_KEY \
-  AIRFLOW__CORE__LOAD_EXAMPLES \
-  AIRFLOW__CORE__SQL_ALCHEMY_CONN \
+# Disable noisy "Handling signal" log messages:
+# ENV GUNICORN_CMD_ARGS --log-level WARNING
 
+RUN set -ex \
+    && buildDeps=' \
+        freetds-dev \
+        libkrb5-dev \
+        libsasl2-dev \
+        libssl-dev \
+        libffi-dev \
+        libpq-dev \
+        git \
+    ' \
+    && apt-get update -yqq \
+    && apt-get upgrade -yqq \
+    && apt-get install -yqq --no-install-recommends \
+        $buildDeps \
+        freetds-bin \
+        build-essential \
+        default-libmysqlclient-dev \
+        apt-utils \
+        curl \
+        rsync \
+        netcat \
+        locales \
+    && sed -i 's/^# en_US.UTF-8 UTF-8$/en_US.UTF-8 UTF-8/g' /etc/locale.gen \
+    && locale-gen \
+    && update-locale LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 \
+    && useradd -ms /bin/bash -d ${AIRFLOW_USER_HOME} airflow \
+    && pip install -U pip setuptools wheel \
+    && pip install pytz \
+    && pip install pyOpenSSL \
+    && pip install ndg-httpsclient \
+    && pip install pyasn1 \
+    && pip install apache-airflow[crypto,celery,postgres,hive,jdbc,mysql,ssh${AIRFLOW_DEPS:+,}${AIRFLOW_DEPS}]==${AIRFLOW_VERSION} \
+    && pip install 'redis==3.2' \
+    && if [ -n "${PYTHON_DEPS}" ]; then pip install ${PYTHON_DEPS}; fi \
+    && apt-get purge --auto-remove -yqq $buildDeps \
+    && apt-get autoremove -yqq --purge \
+    && apt-get clean \
+    && rm -rf \
+        /var/lib/apt/lists/* \
+        /tmp/* \
+        /var/tmp/* \
+        /usr/share/man \
+        /usr/share/doc \
+        /usr/share/doc-base
 
-# Load DAGs exemples (default: Yes)
-if [[ -z "$AIRFLOW__CORE__LOAD_EXAMPLES" && "${LOAD_EX:=n}" == n ]]
-then
-  AIRFLOW__CORE__LOAD_EXAMPLES=False
-fi
+COPY run.sh /entrypoint.sh
+COPY config/airflow.cfg ${AIRFLOW_USER_HOME}/airflow.cfg
 
-# Install custom python package if requirements.txt is present
-if [ -e "/requirements.txt" ]; then
-    $(command -v pip) install --user -r /requirements.txt
-fi
+RUN chown -R airflow: ${AIRFLOW_USER_HOME}
 
-if [ -n "$REDIS_PASSWORD" ]; then
-    REDIS_PREFIX=:${REDIS_PASSWORD}@
-else
-    REDIS_PREFIX=
-fi
+EXPOSE 8080 5555 8793
 
-wait_for_port() {
-  local name="$1" host="$2" port="$3"
-  local j=0
-  while ! nc -z "$host" "$port" >/dev/null 2>&1 < /dev/null; do
-    j=$((j+1))
-    if [ $j -ge $TRY_LOOP ]; then
-      echo >&2 "$(date) - $host:$port still not reachable, giving up"
-      exit 1
-    fi
-    echo "$(date) - waiting for $name... $j/$TRY_LOOP"
-    sleep 5
-  done
-}
-
-if [ "$AIRFLOW__CORE__EXECUTOR" != "SequentialExecutor" ]; then
-  AIRFLOW__CORE__SQL_ALCHEMY_CONN="postgresql+psycopg2://$POSTGRES_USER:$POSTGRES_PASSWORD@$POSTGRES_HOST:$POSTGRES_PORT/$POSTGRES_DB"
-  AIRFLOW__CELERY__RESULT_BACKEND="db+postgresql://$POSTGRES_USER:$POSTGRES_PASSWORD@$POSTGRES_HOST:$POSTGRES_PORT/$POSTGRES_DB"
-  wait_for_port "Postgres" "$POSTGRES_HOST" "$POSTGRES_PORT"
-fi
-
-if [ "$AIRFLOW__CORE__EXECUTOR" = "CeleryExecutor" ]; then
-  AIRFLOW__CELERY__BROKER_URL="redis://$REDIS_PREFIX$REDIS_HOST:$REDIS_PORT/1"
-  wait_for_port "Redis" "$REDIS_HOST" "$REDIS_PORT"
-fi
-
-case "$1" in
-  webserver)
-    airflow initdb
-    if [ "$AIRFLOW__CORE__EXECUTOR" = "LocalExecutor" ] || [ "$AIRFLOW__CORE__EXECUTOR" = "SequentialExecutor" ]; then
-      # With the "Local" and "Sequential" executors it should all run in one container.
-      airflow scheduler &
-    fi
-    exec airflow webserver
-    ;;
-  worker|scheduler)
-    # To give the webserver time to run initdb.
-    sleep 10
-    exec airflow "$@"
-    ;;
-  flower)
-    sleep 10
-    exec airflow "$@"
-    ;;
-  version)
-    exec airflow "$@"
-    ;;
-  *)
-    # The command is something like bash, not an airflow subcommand. Just run it in the right environment.
-    exec "$@"
-    ;;
-esac
+USER airflow
+WORKDIR ${AIRFLOW_USER_HOME}
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["webserver"]
